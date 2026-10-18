@@ -1,0 +1,328 @@
+        public class RegularACFrostbiteEnchantmentController : WeaponEnchantmentLogic,
+IInitiatorRulebookHandler<RulePrepareDamage>,
+IInitiatorRulebookHandler<RuleAttackWithWeapon>
+        {
+            public BlueprintBuff m_CasterBuff;
+
+            [NonSerialized]
+            private bool? _spellSucceededThisAttack;
+
+            private static readonly HashSet<WeaponCategory> ValidWeaponCategories = new HashSet<WeaponCategory>
+{
+    WeaponCategory.UnarmedStrike, WeaponCategory.Claw, WeaponCategory.Bite,
+    WeaponCategory.Gore, WeaponCategory.OtherNaturalWeapons
+};
+
+
+            public void OnEventAboutToTrigger(RuleAttackWithWeapon evt)
+            {
+                if (evt.Weapon == null || !evt.Weapon.Enchantments.Contains(this.Enchantment)) return;
+
+                // This ensures each attack in a full-round action starts fresh.
+                _spellSucceededThisAttack = null;
+            }
+
+            // runs only on a confirmed hit.
+            public void OnEventAboutToTrigger(RulePrepareDamage evt)
+            {
+                if (evt.DamageBundle.Weapon == null || !evt.DamageBundle.Weapon.Enchantments.Contains(this.Enchantment)) return;
+                if (!ValidWeaponCategories.Contains(evt.DamageBundle.Weapon.Blueprint.Category)) return;
+
+                
+                var target = evt.Target;
+                var oozeType = library.TryGet<BlueprintFeature>("7f8f43050f16f6f4d8d212a450b7e273");
+                var swarmType = library.TryGet<BlueprintFeature>("621b62f4955b57f49a6673d3288c3a93");
+
+                if (target.Descriptor.HasFact(Common.construct)
+                    || (oozeType != null && target.Descriptor.HasFact(oozeType))
+                    || (swarmType != null && target.Descriptor.HasFact(swarmType))
+                    || target.Descriptor.HasFact(Common.undead))
+                {
+                    
+                    // The charge will still be consumed in OnEventDidTrigger because it was a hit.
+                    return;
+                }
+
+                var context = evt.Initiator.Descriptor.Buffs.GetBuff(m_CasterBuff)?.Context;
+                if (context == null) return;
+
+                var sr_rule = new RuleSpellResistanceCheck(context, evt.Target);
+                Rulebook.Trigger(sr_rule);
+                _spellSucceededThisAttack = !sr_rule.IsSpellResisted;
+
+                if (_spellSucceededThisAttack != true) return;
+
+                
+                var damageDescription = new DamageDescription
+                {
+                    TypeDescription = new DamageTypeDescription
+                    {
+                        Type = DamageType.Energy,
+                        Energy = DamageEnergyType.Cold
+                    },
+                    Dice = new DiceFormula(1, DiceType.D6),
+                    Bonus = Math.Max(1, Math.Min(10, context.Params.CasterLevel)) 
+                };
+
+                
+                var frostbiteDamage = damageDescription.CreateDamage();
+
+                
+                if (context.HasMetamagic(Metamagic.Empower))
+                {
+                    frostbiteDamage.EmpowerBonus = 1.5f;
+                }
+                if (context.HasMetamagic(Metamagic.Maximize))
+                {
+                    frostbiteDamage.Maximized = true;
+                }
+
+                
+                evt.DamageBundle.Add(frostbiteDamage);
+            }
+
+
+            public void OnEventDidTrigger(RuleAttackWithWeapon evt)
+            {
+                if (evt.Weapon == null || !evt.Weapon.Enchantments.Contains(this.Enchantment)) return;
+
+
+                if (evt.AttackRoll.IsHit && ValidWeaponCategories.Contains(evt.Weapon.Blueprint.Category))
+                {
+                    var context = evt.Initiator.Descriptor.Buffs.GetBuff(m_CasterBuff)?.Context;
+                    if (context != null)
+                    {
+                        var reduce_duration_action = Helpers.Create<ContextActionReduceBuffDuration>(c => {
+                            c.TargetBuff = m_CasterBuff;
+                            c.DurationValue = Helpers.CreateContextDuration(1, DurationRate.Hours);
+                        });
+                        using (context.GetDataScope(evt.Initiator))
+                        {
+                            reduce_duration_action.RunAction();
+                        }
+                    }
+                }
+
+
+                if (evt.AttackRoll.IsHit && _spellSucceededThisAttack == true)
+                {
+                    var context = evt.Initiator.Descriptor.Buffs.GetBuff(m_CasterBuff)?.Context;
+                    if (context != null)
+                    {
+                        var fatigued = library.Get<BlueprintBuff>("e6f2fc5d73d88064583cb828801212f4");
+                        var apply_fatigue_action = Common.createContextActionApplyBuff(fatigued, Helpers.CreateContextDuration(1, DurationRate.Minutes), is_child: true);
+                        using (context.GetDataScope(evt.Target))
+                        {
+                            apply_fatigue_action.RunAction();
+                        }
+                    }
+                }
+            }
+
+            public void OnEventDidTrigger(RulePrepareDamage evt) { }
+        }
+
+
+
+        public class ApplyRegularACFrostbiteEnchantToWeapons : BuffLogic, IUnitSubscriber
+        {
+            public BlueprintWeaponEnchantment Enchantment;
+
+            public WeaponCategory[] Categories = new WeaponCategory[] {
+    WeaponCategory.UnarmedStrike, WeaponCategory.Claw, WeaponCategory.Bite,
+    WeaponCategory.Gore, WeaponCategory.OtherNaturalWeapons
+};
+
+            public override void OnFactActivate() { ApplyEnchantment(); }
+            public override void OnFactDeactivate() { RemoveEnchantment(); }
+
+            private void ApplyEnchantment()
+            {
+                foreach (var weapon in this.Owner.Body.AdditionalLimbs.Concat(this.Owner.Body.Hands).Select(h => h.Weapon))
+                {
+                    if (weapon != null && this.Categories.Contains(weapon.Blueprint.Category))
+                    {
+                        weapon.AddEnchantment(this.Enchantment, this.Context);
+                    }
+                }
+            }
+
+            private void RemoveEnchantment()
+            {
+                foreach (var weapon in this.Owner.Body.AdditionalLimbs.Concat(this.Owner.Body.Hands).Select(h => h.Weapon))
+                {
+                    if (weapon != null)
+                    {
+                        // FIX: Correctly find the INSTANCE of the enchantment to remove it.
+                        var enchantmentInstance = weapon.Enchantments.FirstOrDefault(e => e.Blueprint == this.Enchantment);
+                        if (enchantmentInstance != null)
+                        {
+                            weapon.RemoveEnchantment(enchantmentInstance);
+                        }
+                    }
+                }
+            }
+        }
+
+        public class RemoveSelfOnSpellCast : BuffLogic, IInitiatorRulebookHandler<RuleCastSpell>
+        {
+            // This method is called by the Rulebook right BEFORE a spell resolves.
+            public void OnEventAboutToTrigger(RuleCastSpell evt)
+            {
+                
+                this.Buff.Remove();
+            }
+
+            
+            public void OnEventDidTrigger(RuleCastSpell evt) { }
+        }
+
+        static void createRegularACFrostbite()
+{
+    var icon = LoadIcons.Image2Sprite.Create(@"AbilityIcons/FrostBite.png");
+
+    var regular_ac_frostbite_buff = Helpers.CreateBuff("RegularACFrostbiteEnchantBuff", "Regular AC Frostbite",
+        "Your natural and unarmed attacks are enchanted with frost...",
+        "a1b2c3d4e5f6412389a0b1c2d3e4f5a1", icon, null
+    );
+
+    var regular_ac_frostbite_enchantment = Common.createWeaponEnchantment(
+         "RegularACFrostbite_Enchantment",   // name
+         "Regular AC Frostbite Enchantment", // display_name
+            "",                                 // description
+            "",                                 // prefix
+            "",                                 // suffix
+           "a1b2c3d4e5f6412389a0b1c2d3e4f5a2",  // guid 
+            0,                                  // identify_dc
+            null                                // fx_prefab
+    );
+
+    var controller = Helpers.Create<RegularACFrostbiteEnchantmentController>(c => { c.m_CasterBuff = regular_ac_frostbite_buff; });
+    regular_ac_frostbite_enchantment.AddComponent(controller);
+
+    var manager = Helpers.Create<ApplyRegularACFrostbiteEnchantToWeapons>(c => { c.Enchantment = regular_ac_frostbite_enchantment; });
+    regular_ac_frostbite_buff.AddComponent(manager);
+    regular_ac_frostbite_buff.AddComponent(Helpers.Create<RemoveSelfOnSpellCast>());
+    var forbid_extend_component = Helpers.Create<ForbidSpecificMetamagic>(f => f.MetamagicToForbid = Metamagic.Extend);
+
+
+    regular_ac_frostbite_buff.AddComponent(Helpers.CreateContextRankConfig(
+        baseValueType: ContextRankBaseValueType.CasterLevel,
+        progression: ContextRankProgression.AsIs,
+        max: 10,
+        type: AbilityRankType.Default
+    ));
+
+    var hold_charge_variant = Helpers.CreateAbility("RegularACFrostbiteHoldCharge",
+        "Regular AC Frostbite (Hold Charge)",
+        "As a standard action, you cast the spell on yourself, enchanting your natural and unarmed attacks for 1 minute per level. You can move and take other actions after casting.",
+        "a1b2c3d4e5f6412389a0b1c2d3e4f5a3",
+        icon, AbilityType.Spell, UnitCommand.CommandType.Standard, AbilityRange.Personal, "1 min/level", "",
+        Helpers.CreateRunActions(Common.createContextActionApplyBuff(regular_ac_frostbite_buff, Helpers.CreateContextDuration(Helpers.CreateContextValue(AbilityRankType.Default), DurationRate.Hours), is_from_spell: true)),
+        Helpers.CreateContextRankConfig(),
+        Helpers.CreateSpellComponent(SpellSchool.Transmutation),
+
+        Helpers.CreateSpellDescriptor(SpellDescriptor.Cold)
+    );
+    hold_charge_variant.SpellResistance = false;
+    hold_charge_variant.AddComponent(forbid_extend_component);
+    Helpers.SetField(hold_charge_variant, "m_IsFullRoundAction", false);
+
+
+
+    var immediate_attack_variant = Helpers.CreateAbility("RegularACFrostbiteImmediateAttack",
+        "Attack",
+        "As a standard action, you cast the spell on yourself and immediately make a single melee attack against a target.",
+        "a1b2c3d4e5f6412389a0b1c2d3e4f5a4",
+        icon, AbilityType.Spell, UnitCommand.CommandType.Standard, AbilityRange.Touch, "1 min/level", "",
+        Helpers.CreateRunActions(
+            Common.createContextActionOnContextCaster(
+                Common.createContextActionApplyBuff(regular_ac_frostbite_buff, Helpers.CreateContextDuration(Helpers.CreateContextValue(AbilityRankType.Default), DurationRate.Hours), is_from_spell: true)
+            ),
+
+            Common.createContextActionForceAttack()
+        ),
+        Helpers.CreateContextRankConfig(),
+        Helpers.CreateSpellComponent(SpellSchool.Transmutation),
+
+        Helpers.CreateSpellDescriptor(SpellDescriptor.Cold)
+
+    );
+    immediate_attack_variant.setMiscAbilityParametersTouchHarmful();
+
+    Helpers.SetField(immediate_attack_variant, "m_IsFullRoundAction", false);
+    immediate_attack_variant.SpellResistance = false;
+    immediate_attack_variant.AddComponent(forbid_extend_component);
+
+
+
+    var regular_ac_frostbite = Helpers.CreateAbility("RegularACFrostbiteAbility",
+                                         "Frostbite Enchantment",
+                                         "Enchant your natural & unarmed attacks with chilling power. Deal additionally 1d6 points of cold damage + 1 point per level - Max 10, and the target is fatigued. You can use it up to one time per level.", // Description
+                                         "a1b2c3d4e5f6412389a0b1c2d3e4f5a5",
+                                         icon,
+                                         AbilityType.Spell,
+                                         UnitCommand.CommandType.Standard,
+                                         AbilityRange.Personal,
+                                         "", ""
+
+
+    );
+
+    hold_charge_variant.Parent = regular_ac_frostbite;
+    immediate_attack_variant.Parent = regular_ac_frostbite;
+    regular_ac_frostbite.AddComponent(Helpers.CreateAbilityVariants(regular_ac_frostbite, new BlueprintAbility[] { immediate_attack_variant, hold_charge_variant }));
+
+    regular_ac_frostbite.AddComponent(Helpers.CreateSpellComponent(SpellSchool.Transmutation));
+
+    Helpers.SetField(regular_ac_frostbite, "m_IsFullRoundAction", false);
+    regular_ac_frostbite.AvailableMetamagic = Metamagic.Quicken | Metamagic.Heighten | Metamagic.Empower | Metamagic.Maximize | (Metamagic)MetamagicFeats.MetamagicExtender.Rime | (Metamagic)MetamagicFeats.MetamagicExtender.Dazing;
+    regular_ac_frostbite.AddComponent(forbid_extend_component);
+
+    regular_ac_frostbite.AddToSpellList(Helpers.druidSpellList, 1);
+    regular_ac_frostbite.AddToSpellList(Helpers.magusSpellList, 1);
+
+}
+
+
+    [AllowedOn(typeof(BlueprintAbility))] // qwerty 
+    public class ForbidSpecificMetamagic : BlueprintComponent
+    {
+        public Metamagic MetamagicToForbid;
+    }
+
+    public static class MetamagicRod_Patch
+    {
+        
+        [Harmony12.HarmonyPatch(typeof(MetamagicRodMechanics), "IsSuitableAbility")]
+        public static class MetamagicRodMechanics_IsSuitableAbility_Patch
+        {
+            // This is a Prefix patch. It runs *before* the original IsSuitableAbility method.
+            // If it returns 'false', the original method is skipped completely.
+            public static bool Prefix(MetamagicRodMechanics __instance, ref bool __result, BlueprintAbility ability)
+            {
+               
+                var forbidComponent = ability.GetComponent<ForbidSpecificMetamagic>();
+
+                
+                if (forbidComponent == null)
+                {
+                    return true; 
+                }
+
+                
+                if (forbidComponent.MetamagicToForbid == __instance.Metamagic)
+                {
+                    
+                    __result = false;
+
+                    
+                    return false; 
+                }
+
+               
+                return true;
+            }
+        }
+    }
+        
